@@ -1,0 +1,427 @@
+---
+title: "ExpectedPoints_2021"
+author: "Matt Savoca"
+date: "1/30/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### packages ----
+```{r packages}
+library(easypackages)
+library(devtools)
+
+packages(
+  "httr",
+  "glue",
+  "rvest",
+  "tidyverse",
+  "h2o",
+  "glue",
+  "janitor",
+  "skimr",
+  "tidymodels",
+  "pracma",
+  "slider",
+  "ranger",
+  "xgboost",
+  "vip",
+  "fastshap",
+  prompt = F
+)
+theme_set(theme_light())
+
+project_dir = "~/Dropbox/Matt Savoca/Projects/NFL 2021/"
+scripts_path = glue::glue("{project_dir}/scripts/wrte_fantasy_starter_model_helpers.R")
+source(scripts_path)
+```
+
+#### scrape ----
+Scrape Data or Read Locally
+```{r getting data}
+
+#Scrape: (Commented Out)
+# gather_and_save_pff_ep_df()
+  
+# Local:
+qb_ep_df = read_csv(paste0(project_dir,"/data/pff_qb_ep.csv"))
+skill_ep_df = read_csv(paste0(project_dir, "data/pff_skill_ep.csv"))
+```
+
+
+#pre-processing ----
+
+Preprocessing
+```{r data preprocessing}
+skill_df = skill_ep_df %>% 
+  skill_ep_preprocess()
+```
+
+
+```{r}
+#QB_df
+qb_df = qb_ep_df %>% 
+  skill_ep_qbdf_preprocess()
+```
+
+
+# model_Df -----
+```{r model df}
+model_df = skill_df %>%
+  left_join(
+    qb_df %>% ungroup() %>% select(-player_id)
+  )
+
+model_df_nested = model_df %>%
+  # remove unneccesary/data leakage columns
+  select(-team_id, -player_id, -week_id, -year, -week, 
+         -player_gm, -qb_player_gm, -pos2, -pos2_rk, -flex_rk, -is_hit) %>%
+  filter(!is.na(hit_weeks)) %>%
+  group_by(position) %>%
+  nest()
+```
+
+
+Splitting the data by position, including a combined WR/TE df
+```{r sample df (1st model)}
+rb_df = model_df_nested$data[[3]]
+wr_df = model_df_nested$data[[2]]
+te_df = model_df_nested$data[[1]]
+rec_df = rbind(wr_df, te_df)
+```
+
+
+Initialize H2O.ai
+```{r}
+h2o.init()
+```
+
+
+```{r initial splitt}
+rb_split = initial_split(rb_df, prop = .8)
+rb_train = rb_split %>% training() %>% as.h2o()
+rb_test = rb_split %>% testing() %>% as.h2o()
+
+###
+
+rec_split = initial_split(rec_df, prop = .8)
+rec_train = rec_split %>% training() %>% as.h2o()
+rec_test = rec_split %>% testing() %>% as.h2o()
+
+```
+
+```{r}
+rec_aml = h2o.automl(y = "hit_weeks", training_frame = rec_train, max_runtime_secs = 1000, validation_frame = rec_test)
+rec_aml %>% h2o.get_leaderboard(extra_columns = 'ALL')
+```
+
+```{r}
+h2o.explain(rec_aml@leaderboard[[1]][3], rec_test)
+```
+
+
+
+
+# modelling ----
+Model Process with one DF
+
+```{r sample df (1st model)}
+df = model_df_nested$data[[2]]
+```
+
+Initial split
+```{r initial splitt}
+tidy_split = initial_split(df, prop = .8)
+train_data = training(tidy_split)
+test_data = testing(tidy_split)
+```
+
+Cross Validation Folds
+```{r CV folds}
+k_folds_data = vfold_cv(train_data, v = 5)
+```
+
+tune model
+```{r ranger model}
+ranger_recipe <- 
+  recipe(formula = fp_wkn1 ~ ., data = train_data) %>%
+  step_naomit(all_numeric(), -all_outcomes(), skip = T) %>%
+  step_corr(all_numeric(), -all_outcomes(),
+            threshold = tune("num_thresh")
+            ) %>%
+  step_nzv(all_numeric(), -all_outcomes()) %>%
+  step_normalize(all_numeric(), -all_outcomes()) %>%
+  step_YeoJohnson(all_numeric(), -all_outcomes())
+
+ranger_spec <- 
+  rand_forest(mtry = tune("rf_mtry"), min_n = tune(), trees = tune()) %>% 
+  set_mode("regression") %>% 
+  set_engine("ranger") 
+
+ranger_workflow <- 
+  workflow() %>% 
+  add_recipe(ranger_recipe) %>% 
+  add_model(ranger_spec) 
+
+
+model_metrics = metric_set(rmse, rsq, mae)
+
+ranger_rec_grid = merge(
+  grid_regular(
+    finalize(parameters(ranger_spec),train_data),
+    levels = 3),
+  grid_regular(
+    finalize(parameters(ranger_recipe), train_data),
+    levels = 3)
+  )
+
+paste0("Workflow will execute ", nrow(ranger_rec_grid) * nrow(k_folds_data), " distinct models across ", nrow(k_folds_data), " folds")
+```
+
+```{r}
+# run model
+doParallel::registerDoParallel()
+tic()
+ranger_tune <-
+  tune_grid(  
+    ranger_workflow, 
+    resamples = k_folds_data,
+    grid = ranger_rec_grid,
+    metrics = model_metrics)
+toc()
+```
+
+```{r}
+autoplot(ranger_tune)
+```
+
+```{r}
+best_mae = select_best(ranger_tune, "mae")
+final_rf = finalize_workflow(ranger_workflow, best_mae)
+final_rf
+```
+
+```{r}
+wf_final = last_fit(final_rf, tidy_split)
+wf_final %>% collect_predictions()
+```
+
+```{r}
+wf_final %>% 
+  collect_predictions() %>%
+  filter(fp_wkn1 > 0) %>%
+  mutate(.error = abs(.pred - fp_wkn1),
+         pt_color = if_else(.error >= 10,"red","black")) %>%
+  ggplot()+
+  aes(.pred, .error)+
+  geom_point(aes(color = pt_color))+
+  geom_smooth(lty = 2)+
+  scale_color_identity()
+```
+
+
+```{r}
+rf_vip %>%
+  slice_max(Importance, n = 20) %>%
+  mutate(Variable = reorder(Variable, Importance)) %>%
+  ggplot()+
+  aes(Importance, Variable)+
+  geom_col(color = "blue", alpha = .3)
+```
+
+
+```{r}
+xgboost_recipe <- 
+  recipe(formula = fp_wkn1 ~ ., data = train_data) %>%
+  step_naomit(all_numeric(), -all_outcomes(), skip = T) %>%
+  step_corr(all_numeric(), -all_outcomes()
+            ,threshold = tune("num_thresh")
+            ) %>%
+  step_nzv(all_numeric(), -all_outcomes()) %>%
+  step_normalize(all_numeric(), -all_outcomes()) %>%
+  step_YeoJohnson(all_numeric(), -all_outcomes()) %>%
+  step_intercept()
+  
+
+xgboost_spec <- 
+  boost_tree(trees = tune(), min_n = tune(), tree_depth = tune(), learn_rate = tune(), 
+    loss_reduction = tune(), sample_size = tune()) %>% 
+  set_mode("regression") %>% 
+  set_engine("xgboost") 
+
+xgboost_workflow <- 
+  workflow() %>% 
+  add_recipe(xgboost_recipe) %>% 
+  add_model(xgboost_spec) 
+
+model_rec_grid = merge(
+  grid_regular(
+    finalize(parameters(xgboost_spec),train_data),
+    levels = 2),
+  grid_regular(
+    finalize(parameters(xgboost_recipe),train_data),
+    levels = 2))
+```
+
+```{r fit xgboost model}
+set.seed(27599)
+doParallel::registerDoParallel()
+tic()
+xgboost_tune <-
+  tune_grid(xgboost_workflow, resamples = k_folds_data, grid = model_rec_grid, metrics = model_metrics)
+toc()
+```
+
+
+```{r}
+best_xgb_mae = select_best(xgboost_tune, "mae")
+final_xgb = finalize_workflow(xgboost_workflow, best_xgb_mae)
+final_xgb
+```
+
+```{r}
+wf_xgb_final = last_fit(final_xgb, tidy_split)
+wf_xgb_final %>% collect_metrics()
+```
+
+```{r}
+wf_xgb_final %>% 
+  collect_predictions() %>%
+  mutate(.resid = fp_wkn1 - .pred,
+         pt_color = case_when(
+           .resid >= 10 ~ "red",
+           .resid <= -10 ~ "orange",
+           TRUE ~ "black"),
+         .resid = abs(.resid)) %>%
+  ggplot()+
+  aes(.pred, fp_wkn1)+
+  geom_point(aes(color = pt_color))+
+  geom_smooth(lty = 2)+
+  scale_color_identity()
+```
+
+```{r}
+
+xgb_vip = pull_workflow_fit(wf_xgb_final$.workflow[[1]]) %>% vi()
+
+xgb_vip %>%
+  slice_max(Importance, n = 9) %>%
+  mutate(Variable = reorder(Variable, Importance)) %>%
+  ggplot()+
+  aes(Importance, Variable)+
+  geom_col(color = "blue", alpha = .3)
+  
+```
+
+```{r}
+xgboost_final_rec <- 
+  recipe(formula = fp_wkn1 ~ ., data = train_data) %>%
+  step_naomit(all_numeric(), skip = T) %>%
+  step_corr(all_numeric(), -all_outcomes()
+            ,threshold = 1
+            ) %>%
+  step_nzv(all_numeric(), -all_outcomes()) %>%
+  step_normalize(all_numeric(), -all_outcomes()) %>%
+  step_YeoJohnson(all_numeric(), -all_outcomes()) %>%
+  step_intercept()
+
+
+
+X <- prep(xgboost_final_rec, train_data) %>% 
+  juice() %>% 
+  select(-fp_wkn1) %>%
+  as.matrix()
+
+xg_mod = pull_workflow_fit(wf_xgb_final$.workflow[[1]])
+
+shap <- fastshap::explain(xg_mod$fit, X = X, exact = TRUE)
+
+autoplot(shap,num_features = 20)
+```
+
+```{r}
+feat <- prep(xgboost_final_rec, train_data) %>% 
+  juice()
+
+autoplot(shap, 
+         type = "dependence", 
+         feature = "roll2_yve_rec", 
+         X = feat,
+         smooth = T,
+         color_by = "fp_wkn1")
+
+```
+
+
+```{r}
+options(scipen = 999)
+rec_predict_hf = rec_test %>% h2o.cbind(h2o.predict(rec_aml@leader, rec_test))
+rec_predict_df = rec_predict_hf %>% as.data.frame()
+```
+
+```{r}
+rec_predict_df %>% 
+  ggplot()+
+  aes(predict, hit_weeks)+
+  geom_point()
+```
+
+```{r}
+final_hf = model_df %>%
+  filter(pos2 == "REC") %>%
+  as.h2o()
+  
+final_df = final_hf %>%
+  h2o.cbind(h2o.predict(rec_aml@leader,final_hf)) %>%
+  as.data.frame() %>%
+  group_by(player_id) %>%
+  filter(player_gm == max(player_gm,na.rm = T)) %>%
+  ungroup() %>%
+  mutate(hwve = hit_weeks - predict) %>%
+  arrange(-predict) %>%
+  select(player_id, team_id, position, week_id, predict, hwve) %>%
+  distinct() %>%
+  left_join(
+    skill_ep_df %>% select(player_id, team_id, team, player) %>% distinct()
+  )
+```
+
+
+
+####RB -------
+RB Model
+
+```{r}
+rb_aml = h2o.automl(y = "fp_next8", training_frame = rb_train, max_runtime_secs = 500, stopping_metric = "MAE")
+```
+
+
+```{r}
+h2o.explain(rb_aml, rb_test,top_n_features = 3)
+```
+
+
+```{r}
+h2o.explain(rb_aml@leader, rb_test)
+```
+```{r}
+rb_aml@leader
+```
+
+```{r}
+model_df = skill_df %>%
+  mutate(is_hit = as.factor(is_hit)) %>%
+  left_join(
+    qb_df %>% ungroup() %>% select(-player_id)
+  )
+
+model_df_nested = model_df %>%
+  select(-team_id, -player_id, -week_id, -year, -week, -player_gm, -qb_player_gm, -pos2, -pos2_rk, -flex_rk, -is_hit) %>%
+  filter(!is.na(hit_wkn1)) %>%
+  group_by(position) %>%
+  nest()
+```
+

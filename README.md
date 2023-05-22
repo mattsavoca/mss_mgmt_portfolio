@@ -39,9 +39,9 @@ R autoML - WR and TE Starter Probability: https://github.com/mattsavoca/resq_cod
 
 Python autoML: https://github.com/mattsavoca/resq_code/blob/main/h2o_aml.ipynb
 
-
+# My Info
 ## Matt Savoca
-### mattscottsavoca@gmail.com | mattsavoca.com
+### mattscottsavoca@gmail.com | [mattsavoca.com](https://mattsavoca.com)
 ### Tech Stack:
 - Programming: R, Python
 - Machine Learning: TidyModels, h2o.ai, scikit-learn
